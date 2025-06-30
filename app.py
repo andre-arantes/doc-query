@@ -93,7 +93,7 @@ def generate_response(query, context_chunks):
 
 [Resposta]
 """
-
+    # tester
     llm = load_llm()
 
     try:
