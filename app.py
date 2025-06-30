@@ -5,14 +5,16 @@ import numpy as np
 import faiss
 import requests
 
-# --- CONFIGURAÇÕES ---
+# --- Configurações da Hugging Face ---
 HF_API_TOKEN = st.secrets["hf_token"]
-MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.2"
+MODEL_ID = "google/flan-t5-base"
 API_URL = f"https://api-inference.huggingface.co/models/{MODEL_ID}"
 HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+
+# --- Modelo de Embeddings ---
 EMBEDDING_MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-# --- FUNÇÕES AUXILIARES ---
+# --- Funções auxiliares ---
 
 def extract_text_from_pdf(pdf_files):
     text = ""
@@ -43,29 +45,23 @@ def create_faiss_index(embeddings):
     index.add(embeddings)
     return index
 
-def query_huggingface(question, context):
-    prompt = f"""
-Leia o conteúdo abaixo e responda de forma direta à pergunta.
-
-[Conteúdo]
-{context}
-
-[Pergunta]
-{question}
-
-[Resposta]
-"""
-    response = requests.post(API_URL, headers=HEADERS, json={"inputs": prompt})
+def query_huggingface_flant5(question, context):
+    prompt = f"Context: {context}\n\nQuestion: {question}\nAnswer:"
+    payload = {
+        "inputs": prompt,
+        "parameters": {"max_new_tokens": 128}
+    }
+    response = requests.post(API_URL, headers=HEADERS, json=payload)
     if response.status_code == 200:
-        return response.json()[0]["generated_text"].split("[Resposta]")[-1].strip()
+        return response.json()[0]["generated_text"].strip()
     else:
         return f"Erro: {response.text}"
 
-# --- APP STREAMLIT ---
+# --- App Streamlit ---
 
-st.set_page_config(page_title="Assistente PDF", layout="centered")
+st.set_page_config(page_title="Assistente PDF com FLAN-T5", layout="centered")
 st.title("📚 Assistente PDF com LLM")
-st.markdown("Faça upload de um ou mais PDFs e faça perguntas sobre o conteúdo.")
+st.markdown("Faça upload de PDFs e faça perguntas com base no conteúdo.")
 
 # Sessão
 if "messages" not in st.session_state:
@@ -75,7 +71,7 @@ if "faiss_index" not in st.session_state:
 if "chunks" not in st.session_state:
     st.session_state.chunks = []
 
-# Exibir mensagens anteriores
+# Histórico de mensagens
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -94,20 +90,19 @@ with st.sidebar:
         st.session_state.faiss_index = index
         st.success("PDFs processados com sucesso!")
 
-# Perguntas
+# Input do usuário
 query = st.chat_input("Digite sua pergunta")
 if query and st.session_state.faiss_index:
     with st.chat_message("user"):
         st.markdown(query)
     st.session_state.messages.append({"role": "user", "content": query})
 
-    # Buscar contexto relevante
     question_embedding = EMBEDDING_MODEL.encode([query]).astype("float32")
     D, I = st.session_state.faiss_index.search(question_embedding, k=3)
     context = "\n".join([st.session_state.chunks[i] for i in I[0]])
 
     with st.spinner("Pensando..."):
-        answer = query_huggingface(query, context)
+        answer = query_huggingface_flant5(query, context)
 
     with st.chat_message("assistant"):
         st.markdown(answer)
@@ -118,4 +113,4 @@ elif query:
 
 # Rodapé
 st.markdown("---")
-st.caption("Desenvolvido com ❤️ usando Streamlit e Hugging Face")
+st.caption("Made by André Arantes")
