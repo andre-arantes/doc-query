@@ -1,18 +1,21 @@
 import streamlit as st
 from PyPDF2 import PdfReader
-from sentence_transformers import SentenceTransformer
 import numpy as np
 import faiss
 import requests
 
 # --- Configurações da Hugging Face ---
 HF_API_TOKEN = st.secrets["hf_token"]
-MODEL_ID = "google/flan-t5-base"
-API_URL = f"https://api-inference.huggingface.co/models/{MODEL_ID}"
-HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
 
-# --- Modelo de Embeddings ---
-EMBEDDING_MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+# Modelo de geração de texto
+FLAN_MODEL_ID = "google/flan-t5-base"
+FLAN_API_URL = f"https://api-inference.huggingface.co/models/{FLAN_MODEL_ID}"
+FLAN_HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+
+# Modelo de embeddings (via API)
+EMBEDDING_MODEL_ID = "intfloat/e5-small"
+EMBEDDING_API_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{EMBEDDING_MODEL_ID}"
+EMBEDDING_HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
 
 # --- Funções auxiliares ---
 
@@ -38,7 +41,18 @@ def get_text_chunks(text, max_chunk_size=300):
     return chunks
 
 def generate_embeddings(chunks):
-    return EMBEDDING_MODEL.encode(chunks).astype("float32")
+    embeddings = []
+    for chunk in chunks:
+        payload = {"inputs": chunk}
+        response = requests.post(EMBEDDING_API_URL, headers=EMBEDDING_HEADERS, json=payload)
+        if response.status_code == 200:
+            emb = response.json()
+            # emb é uma lista de floats
+            embeddings.append(emb)
+        else:
+            st.error(f"Erro na geração do embedding: {response.text}")
+            embeddings.append([0]*768)  # fallback: vetor zero (ajuste se precisar)
+    return np.array(embeddings).astype("float32")
 
 def create_faiss_index(embeddings):
     index = faiss.IndexFlatL2(embeddings.shape[1])
@@ -51,7 +65,7 @@ def query_huggingface_flant5(question, context):
         "inputs": prompt,
         "parameters": {"max_new_tokens": 128}
     }
-    response = requests.post(API_URL, headers=HEADERS, json=payload)
+    response = requests.post(FLAN_API_URL, headers=FLAN_HEADERS, json=payload)
     if response.status_code == 200:
         return response.json()[0]["generated_text"].strip()
     else:
@@ -59,7 +73,7 @@ def query_huggingface_flant5(question, context):
 
 # --- App Streamlit ---
 
-st.set_page_config(page_title="Assistente PDF com FLAN-T5", layout="centered")
+st.set_page_config(page_title="Assistente PDF com FLAN-T5 + Embeddings API", layout="centered")
 st.title("📚 Assistente PDF com LLM")
 st.markdown("Faça upload de PDFs e faça perguntas com base no conteúdo.")
 
@@ -97,16 +111,22 @@ if query and st.session_state.faiss_index:
         st.markdown(query)
     st.session_state.messages.append({"role": "user", "content": query})
 
-    question_embedding = EMBEDDING_MODEL.encode([query]).astype("float32")
-    D, I = st.session_state.faiss_index.search(question_embedding, k=3)
-    context = "\n".join([st.session_state.chunks[i] for i in I[0]])
+    # Gera embedding do input
+    payload = {"inputs": query}
+    response = requests.post(EMBEDDING_API_URL, headers=EMBEDDING_HEADERS, json=payload)
+    if response.status_code == 200:
+        question_embedding = np.array(response.json()).astype("float32").reshape(1, -1)
+        D, I = st.session_state.faiss_index.search(question_embedding, k=3)
+        context = "\n".join([st.session_state.chunks[i] for i in I[0]])
 
-    with st.spinner("Pensando..."):
-        answer = query_huggingface_flant5(query, context)
+        with st.spinner("Pensando..."):
+            answer = query_huggingface_flant5(query, context)
 
-    with st.chat_message("assistant"):
-        st.markdown(answer)
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+    else:
+        st.error(f"Erro ao gerar embedding da pergunta: {response.text}")
 
 elif query:
     st.warning("Por favor, carregue e processe os PDFs primeiro.")
