@@ -3,29 +3,17 @@ from PyPDF2 import PdfReader
 from sentence_transformers import SentenceTransformer
 import numpy as np
 import faiss
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-import torch
+from transformers import AutoTokenizer, pipeline
 
-# Configurações iniciais
+# Modelo de embeddings leve e rápido
 EMBEDDING_MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-LLM_MODEL_NAME = "google/flan-t5-large"
-
-@st.cache_resource
-def load_tokenizer_and_model():
-    tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
-    model = AutoModelForSeq2SeqLM.from_pretrained(LLM_MODEL_NAME)
-    return tokenizer, model
 
 def extract_text_from_pdf(pdf_files):
     text = ""
     for pdf in pdf_files:
-        try:
-            reader = PdfReader(pdf)
-            for page in reader.pages:
-                page_text = page.extract_text() or ""
-                text += page_text + "\n"
-        except Exception as e:
-            st.error(f"Erro ao extrair texto do PDF {pdf.name}: {e}")
+        reader = PdfReader(pdf)
+        for page in reader.pages:
+            text += (page.extract_text() or "") + "\n"
     return text
 
 def get_text_chunks(text, max_chunk_size=300):
@@ -40,84 +28,106 @@ def get_text_chunks(text, max_chunk_size=300):
             current_chunk = sentence + ". "
     if current_chunk:
         chunks.append(current_chunk.strip())
-    return [chunk for chunk in chunks if chunk]
+    return chunks
 
 def generate_embeddings(text_chunks):
-    if not text_chunks:
-        return np.array([])
-    embeddings = EMBEDDING_MODEL.encode(text_chunks, show_progress_bar=False)
-    return embeddings.astype('float32')
+    return EMBEDDING_MODEL.encode(text_chunks, show_progress_bar=False).astype('float32')
 
 def create_faiss_index(embeddings):
-    if embeddings.size == 0:
-        return None
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dim)
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
     index.add(embeddings)
     return index
 
-def generate_response_flant5(query, context_chunks, tokenizer, model, max_input_length=512):
-    # Junta os contextos numa string
-    context_str = "\n".join(context_chunks)
-    prompt = f"Responda a pergunta com base no texto abaixo:\n\n{context_str}\n\nPergunta: {query}\nResposta:"
-    
-    # Tokenizar entrada e truncar para max tokens permitidos
-    inputs = tokenizer(prompt, return_tensors="pt", max_length=max_input_length, truncation=True)
-    with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=150)
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    # Remover o próprio prompt da resposta, se aparecer
-    response = response.replace(prompt, "").strip()
-    return response
+def truncate_context(context, question, max_tokens=800):
+    tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
+    prompt = f"{context}\n\nPergunta: {question}\nResposta:"
+    tokens = tokenizer.encode(prompt)
+    truncated = tokenizer.decode(tokens[:max_tokens], skip_special_tokens=True)
+    return truncated
 
-# Interface Streamlit
-st.set_page_config(page_title="Assistente PDF com FLAN-T5-Large", layout="centered")
-st.title("📄 Assistente PDF com FLAN-T5-Large")
+@st.cache_resource
+def load_llm():
+    return pipeline(
+        "text2text-generation",
+        model="google/flan-t5-base",
+        tokenizer="google/flan-t5-base",
+        max_length=200,
+        do_sample=False,
+        temperature=0.1,
+    )
 
+def generate_response(query, context):
+    if not context:
+        return "Não encontrei informações relevantes nos documentos."
+
+    context_str = "\n".join(context)
+    context_str = truncate_context(context_str, query, max_tokens=800)
+    prompt = f"Leia o conteúdo abaixo e responda de forma direta à pergunta.\n\n{context_str}\n\nPergunta: {query}\nResposta:"
+
+    llm = load_llm()
+    output = llm(prompt)[0]['generated_text']
+    return output.strip()
+
+# Streamlit UI
+st.set_page_config(page_title="Assistente PDF", layout="centered")
+st.title("📚 Assistente PDF")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 if "text_chunks" not in st.session_state:
     st.session_state.text_chunks = []
 if "embeddings" not in st.session_state:
     st.session_state.embeddings = None
 if "faiss_index" not in st.session_state:
     st.session_state.faiss_index = None
-if "processed" not in st.session_state:
-    st.session_state.processed = False
+if "documents_processed" not in st.session_state:
+    st.session_state.documents_processed = False
 
-pdf_files = st.file_uploader("Envie seus arquivos PDF", accept_multiple_files=True, type=["pdf"])
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-if st.button("Processar PDFs"):
-    if pdf_files:
-        with st.spinner("Extraindo texto e criando índice..."):
-            raw_text = extract_text_from_pdf(pdf_files)
-            chunks = get_text_chunks(raw_text)
-            embeddings = generate_embeddings(chunks)
-            faiss_index = create_faiss_index(embeddings)
-            
-            st.session_state.text_chunks = chunks
-            st.session_state.embeddings = embeddings
-            st.session_state.faiss_index = faiss_index
-            st.session_state.processed = True
-            
-        st.success(f"Processados {len(pdf_files)} arquivos com {len(chunks)} chunks.")
+user_query = st.chat_input("Faça uma pergunta sobre o PDF")
+
+if user_query:
+    if not st.session_state.documents_processed:
+        st.error("Faça upload e processe os PDFs antes de fazer perguntas.")
     else:
-        st.warning("Por favor, envie ao menos um arquivo PDF.")
+        with st.chat_message("user"):
+            st.markdown(user_query)
+        st.session_state.messages.append({"role": "user", "content": user_query})
 
-tokenizer, model = load_tokenizer_and_model()
+        query_embedding = EMBEDDING_MODEL.encode([user_query]).astype('float32')
+        D, I = st.session_state.faiss_index.search(query_embedding, k=3)
+        relevant_context = [st.session_state.text_chunks[i] for i in I[0] if i < len(st.session_state.text_chunks)]
 
-query = st.text_input("Faça sua pergunta sobre os PDFs processados")
+        with st.spinner("Gerando resposta..."):
+            response = generate_response(user_query, relevant_context)
 
-if st.session_state.processed and query:
-    # Gerar embedding da pergunta
-    query_embedding = EMBEDDING_MODEL.encode([query]).astype('float32')
-    D, I = st.session_state.faiss_index.search(query_embedding, k=3)
-    # Recuperar chunks relevantes
-    relevant_chunks = [st.session_state.text_chunks[i] for i in I[0] if i < len(st.session_state.text_chunks)]
-    
-    with st.spinner("Gerando resposta..."):
-        answer = generate_response_flant5(query, relevant_chunks, tokenizer, model)
-    st.markdown(f"**Resposta:** {answer}")
-elif query:
-    st.warning("Por favor, faça o upload e processe os PDFs antes de perguntar.")
+        with st.chat_message("assistant"):
+            st.markdown(f"**Resposta:**\n{response}")
+        st.session_state.messages.append({"role": "assistant", "content": response})
+
+with st.sidebar:
+    st.title("Documentos")
+    pdf_docs = st.file_uploader("Carregue arquivos PDF", accept_multiple_files=True, type="pdf")
+
+    if st.button("Processar PDFs"):
+        if pdf_docs:
+            with st.spinner("Processando PDFs..."):
+                raw_text = extract_text_from_pdf(pdf_docs)
+                st.session_state.text_chunks = get_text_chunks(raw_text)
+                st.session_state.embeddings = generate_embeddings(st.session_state.text_chunks)
+                st.session_state.faiss_index = create_faiss_index(st.session_state.embeddings)
+                st.session_state.documents_processed = True
+            st.success(f"{len(pdf_docs)} PDFs processados com sucesso!")
+        else:
+            st.warning("Carregue pelo menos um PDF.")
+
+    if st.session_state.documents_processed and st.button("Resetar"):
+        st.session_state.clear()
+        st.experimental_rerun()
 
 st.markdown("---")
 st.caption("Made by André Arantes")
