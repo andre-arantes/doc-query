@@ -87,20 +87,27 @@ def generate_response(query, context):
     context_str = "\n".join(context)
     context_str = truncate_context(context_str, query, max_tokens=512)
 
-    prompt_template = ChatPromptTemplate.from_template(
-        f"Responda com base no texto abaixo:\n\n{context_str}\n\nPergunta: {query}\n\nResposta:"
-    )
+    prompt_template = ChatPromptTemplate.from_template("""
+Você é um assistente inteligente e confiável. Com base no texto abaixo, responda de forma clara, direta e completa à pergunta fornecida.
+Use apenas as informações do texto. Se não encontrar a resposta no texto, diga "Não sei".
+
+### Texto:
+{context}
+
+### Pergunta:
+{input}
+
+### Resposta:""")
 
     llm = load_llm()
     chain = prompt_template | llm
 
     try:
         response = chain.invoke({"context": context_str, "input": query}).strip()
-        return response.replace("Resposta:", "").strip() or "Não sei"
+        return response or "Não sei"
     except Exception as e:
         logger.error("Erro ao gerar resposta: %s", e)
         return "Houve um erro ao tentar gerar a resposta."
-
 
 # =========================== Streamlit Interface ===========================
 
