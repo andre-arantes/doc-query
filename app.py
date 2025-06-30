@@ -61,12 +61,10 @@ def create_faiss_index(embeddings):
 def get_flant5_tokenizer():
     return AutoTokenizer.from_pretrained("google/flan-t5-base")
 
-def truncate_context(context, question, max_tokens=512):
+def truncate_context(context, question, max_tokens=450):
     tokenizer = get_flant5_tokenizer()
-    prompt = f"Responda com base no texto abaixo:\n\n{context}\n\nPergunta: {question}"
-    tokens = tokenizer.encode(prompt, truncation=True, max_length=max_tokens)
-    truncated = tokenizer.decode(tokens, skip_special_tokens=True)
-    return truncated
+    context_tokens = tokenizer.encode(context, truncation=True, max_length=max_tokens)
+    return tokenizer.decode(context_tokens, skip_special_tokens=True)
 
 @st.cache_resource
 def load_llm():
@@ -85,11 +83,11 @@ def generate_response(query, context):
         return "Não encontrei informações relevantes nos documentos."
 
     context_str = "\n".join(context)
-    context_str = truncate_context(context_str, query, max_tokens=512)
+    truncated_context = truncate_context(context_str, query)
 
     prompt_template = ChatPromptTemplate.from_template("""
-Você é um assistente inteligente e confiável. Com base no texto abaixo, responda de forma clara, direta e completa à pergunta fornecida.
-Use apenas as informações do texto. Se não encontrar a resposta no texto, diga "Não sei".
+Você é um assistente inteligente. Com base no texto abaixo, responda à pergunta de forma objetiva.
+Use somente as informações fornecidas. Se não houver dados suficientes, responda "Não sei".
 
 ### Texto:
 {context}
@@ -98,12 +96,12 @@ Use apenas as informações do texto. Se não encontrar a resposta no texto, dig
 {input}
 
 ### Resposta:""")
-
+    
     llm = load_llm()
     chain = prompt_template | llm
 
     try:
-        response = chain.invoke({"context": context_str, "input": query}).strip()
+        response = chain.invoke({"context": truncated_context, "input": query}).strip()
         return response or "Não sei"
     except Exception as e:
         logger.error("Erro ao gerar resposta: %s", e)
