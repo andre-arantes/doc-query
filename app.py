@@ -10,6 +10,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 HF_API_TOKEN = st.secrets["hf_token"]
+print("TOKEN OK:", HF_API_TOKEN[:8])
 MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.2"
 
 if not HF_API_TOKEN:
