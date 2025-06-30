@@ -1,5 +1,5 @@
 # Assistente Conversacional para PDFs
-
+### Link para a aplicação: https://doc-query-skuywzbxibjqoij8vx5yax.streamlit.app/
 Este projeto implementa um assistente conversacional baseado em LLM (Large Language Model) com capacidade de ler documentos PDF, indexá-los com embeddings e responder perguntas sobre seu conteúdo.
 
 ## Tecnologias usadas
