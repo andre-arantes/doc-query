@@ -1,20 +1,33 @@
 import streamlit as st
 from PyPDF2 import PdfReader
+from langchain_community.llms import HuggingFacePipeline
 from sentence_transformers import SentenceTransformer
 import numpy as np
 import faiss
-from transformers import AutoTokenizer, pipeline
+from transformers import AutoTokenizer
+import logging
+import re
 
-# Modelo de embeddings leve e rápido
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 EMBEDDING_MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 def extract_text_from_pdf(pdf_files):
     text = ""
     for pdf in pdf_files:
-        reader = PdfReader(pdf)
-        for page in reader.pages:
-            text += (page.extract_text() or "") + "\n"
+        try:
+            reader = PdfReader(pdf)
+            for page in reader.pages:
+                extracted_text = page.extract_text() or ""
+                text += extracted_text + "\n"
+        except Exception as e:
+            st.error(f"Erro ao extrair texto do PDF {pdf.name}: {e}")
     return text
+
+def clean_text(text):
+    # Remove letras espaçadas (ex: "C a p a z" -> "Capaz")
+    return re.sub(r'(?<=\b)(?:[A-Za-zÀ-ÿ]\s)+(?=[A-Za-zÀ-ÿ])', lambda m: m.group(0).replace(" ", ""), text)
 
 def get_text_chunks(text, max_chunk_size=300):
     chunks = []
@@ -28,34 +41,44 @@ def get_text_chunks(text, max_chunk_size=300):
             current_chunk = sentence + ". "
     if current_chunk:
         chunks.append(current_chunk.strip())
-    return chunks
+    return [chunk for chunk in chunks if chunk]
 
 def generate_embeddings(text_chunks):
-    return EMBEDDING_MODEL.encode(text_chunks, show_progress_bar=False).astype('float32')
+    if not text_chunks:
+        return np.array([])
+    try:
+        embeddings = EMBEDDING_MODEL.encode(text_chunks, show_progress_bar=False)
+        return embeddings.astype('float32')
+    except Exception as e:
+        st.error(f"Erro ao gerar embeddings: {e}")
+        return np.array([])
 
 def create_faiss_index(embeddings):
+    if embeddings.size == 0:
+        return None
     dimension = embeddings.shape[1]
     index = faiss.IndexFlatL2(dimension)
     index.add(embeddings)
     return index
 
 def truncate_context(context, question, max_tokens=800):
-    tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
-    prompt = f"{context}\n\nPergunta: {question}\nResposta:"
+    tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
+    prompt = f"{context}\n\nPergunta: {question}"
     tokens = tokenizer.encode(prompt)
     truncated = tokenizer.decode(tokens[:max_tokens], skip_special_tokens=True)
     return truncated
 
 @st.cache_resource
 def load_llm():
-    return pipeline(
-        "text2text-generation",
-        model="google/flan-t5-base",
-        tokenizer="google/flan-t5-base",
-        max_length=200,
-        do_sample=False,
-        temperature=0.1,
-    )
+    try:
+        return HuggingFacePipeline.from_model_id(
+            model_id="google/flan-t5-base",
+            task="text2text-generation",
+            pipeline_kwargs={"max_new_tokens": 200, "temperature": 0.05, "do_sample": True}
+        )
+    except Exception as e:
+        st.error(f"Erro ao carregar LLM: {e}")
+        raise
 
 def generate_response(query, context):
     if not context:
@@ -63,15 +86,21 @@ def generate_response(query, context):
 
     context_str = "\n".join(context)
     context_str = truncate_context(context_str, query, max_tokens=800)
-    prompt = f"Leia o conteúdo abaixo e responda de forma direta à pergunta.\n\n{context_str}\n\nPergunta: {query}\nResposta:"
 
     llm = load_llm()
-    output = llm(prompt)[0]['generated_text']
-    return output.strip()
+    prompt = f"Responda com base no texto abaixo:\n\n{context_str}\n\nPergunta: {query}"
+
+    try:
+        response = llm.invoke(prompt).strip()
+        return response or "Não sei"
+    except Exception as e:
+        logger.error("Erro ao gerar resposta: %s", e)
+        return "Houve um erro ao tentar gerar a resposta."
 
 # Streamlit UI
-st.set_page_config(page_title="Assistente PDF", layout="centered")
-st.title("📚 Assistente PDF")
+st.set_page_config(page_title="Tarefa AS05", layout="centered")
+st.title("📚 Assistente AS05 - Pergunte sobre um PDF!")
+st.markdown("Faça upload de seus PDFs e faça perguntas sobre o conteúdo deles.")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -91,43 +120,50 @@ for message in st.session_state.messages:
 user_query = st.chat_input("Faça uma pergunta sobre o PDF")
 
 if user_query:
-    if not st.session_state.documents_processed:
-        st.error("Faça upload e processe os PDFs antes de fazer perguntas.")
+    if not st.session_state.documents_processed or st.session_state.faiss_index is None:
+        st.error("Faça o upload e processe seus PDFs na barra lateral.")
     else:
         with st.chat_message("user"):
             st.markdown(user_query)
         st.session_state.messages.append({"role": "user", "content": user_query})
-
-        query_embedding = EMBEDDING_MODEL.encode([user_query]).astype('float32')
-        D, I = st.session_state.faiss_index.search(query_embedding, k=3)
-        relevant_context = [st.session_state.text_chunks[i] for i in I[0] if i < len(st.session_state.text_chunks)]
-
-        with st.spinner("Gerando resposta..."):
-            response = generate_response(user_query, relevant_context)
-
-        with st.chat_message("assistant"):
-            st.markdown(f"**Resposta:**\n{response}")
-        st.session_state.messages.append({"role": "assistant", "content": response})
+        try:
+            query_embedding = EMBEDDING_MODEL.encode([user_query])[0]
+            D, I = st.session_state.faiss_index.search(np.array([query_embedding]).astype('float32'), k=3)
+            relevant_context = [st.session_state.text_chunks[i] for i in I[0] if i < len(st.session_state.text_chunks)]
+            with st.spinner("Gerando resposta..."):
+                response = generate_response(user_query, relevant_context)
+            with st.chat_message("assistant"):
+                st.markdown(f"**Resposta:**\n{response}")
+            st.session_state.messages.append({"role": "assistant", "content": response})
+        except Exception as e:
+            st.error(f"Erro ao gerar resposta: {e}")
 
 with st.sidebar:
-    st.title("Documentos")
-    pdf_docs = st.file_uploader("Carregue arquivos PDF", accept_multiple_files=True, type="pdf")
-
+    st.title("Seus Documentos")
+    pdf_docs = st.file_uploader("Carregue seus arquivos PDF aqui e clique em 'Processar'", accept_multiple_files=True, type="pdf")
     if st.button("Processar PDFs"):
         if pdf_docs:
-            with st.spinner("Processando PDFs..."):
-                raw_text = extract_text_from_pdf(pdf_docs)
-                st.session_state.text_chunks = get_text_chunks(raw_text)
-                st.session_state.embeddings = generate_embeddings(st.session_state.text_chunks)
-                st.session_state.faiss_index = create_faiss_index(st.session_state.embeddings)
-                st.session_state.documents_processed = True
-            st.success(f"{len(pdf_docs)} PDFs processados com sucesso!")
+            try:
+                with st.spinner("Processando PDFs..."):
+                    raw_text = extract_text_from_pdf(pdf_docs)
+                    raw_text = clean_text(raw_text)  # 🔥 Corrigindo letras espaçadas
+                    st.session_state.text_chunks = get_text_chunks(raw_text)
+                    st.session_state.embeddings = generate_embeddings(st.session_state.text_chunks)
+                    st.session_state.faiss_index = create_faiss_index(st.session_state.embeddings)
+                    st.session_state.documents_processed = True
+                    st.success(f"{len(pdf_docs)} PDFs processados com sucesso!")
+            except Exception as e:
+                st.error(f"Erro ao processar PDFs: {e}")
         else:
-            st.warning("Carregue pelo menos um PDF.")
+            st.warning("Carregue pelo menos um arquivo PDF para processar.")
 
-    if st.session_state.documents_processed and st.button("Resetar"):
-        st.session_state.clear()
-        st.experimental_rerun()
+    if st.session_state.faiss_index is not None and st.button("Resetar e fazer upload de novos PDFs"):
+        st.session_state.documents_processed = False
+        st.session_state.messages = []
+        st.session_state.text_chunks = []
+        st.session_state.embeddings = None
+        st.session_state.faiss_index = None
+        st.rerun()
 
 st.markdown("---")
 st.caption("Made by André Arantes")
