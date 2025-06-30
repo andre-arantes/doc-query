@@ -6,16 +6,13 @@ import requests
 
 # --- Configurações da Hugging Face ---
 HF_API_TOKEN = st.secrets["hf_token"]
+EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"  # modelo para embeddings
+LLM_MODEL_ID = "google/flan-t5-base"  # modelo para geração de texto
 
-# Modelo de geração de texto
-FLAN_MODEL_ID = "google/flan-t5-base"
-FLAN_API_URL = f"https://api-inference.huggingface.co/models/{FLAN_MODEL_ID}"
-FLAN_HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+EMBEDDING_API_URL = f"https://api-inference.huggingface.co/models/{EMBEDDING_MODEL_ID}"
+LLM_API_URL = f"https://api-inference.huggingface.co/models/{LLM_MODEL_ID}"
 
-# Modelo de embeddings (via API)
-EMBEDDING_MODEL_ID = "intfloat/e5-small"
-EMBEDDING_API_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{EMBEDDING_MODEL_ID}"
-EMBEDDING_HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
 
 # --- Funções auxiliares ---
 
@@ -40,22 +37,29 @@ def get_text_chunks(text, max_chunk_size=300):
         chunks.append(current_chunk.strip())
     return chunks
 
+def generate_embedding_via_api(text):
+    payload = {"inputs": text}
+    response = requests.post(EMBEDDING_API_URL, headers=HEADERS, json=payload)
+    if response.status_code == 200:
+        # resposta geralmente é uma lista de floats
+        return np.array(response.json()).astype("float32")
+    else:
+        st.error(f"Erro ao gerar embedding: {response.text}")
+        return None
+
 def generate_embeddings(chunks):
     embeddings = []
     for chunk in chunks:
-        payload = {"inputs": chunk}
-        response = requests.post(EMBEDDING_API_URL, headers=EMBEDDING_HEADERS, json=payload)
-        if response.status_code == 200:
-            emb = response.json()
-            # emb é uma lista de floats
+        emb = generate_embedding_via_api(chunk)
+        if emb is not None:
             embeddings.append(emb)
         else:
-            st.error(f"Erro na geração do embedding: {response.text}")
-            embeddings.append([0]*768)  # fallback: vetor zero (ajuste se precisar)
-    return np.array(embeddings).astype("float32")
+            embeddings.append(np.zeros(384, dtype="float32"))  # fallback (dimensão do MiniLM é 384)
+    return np.vstack(embeddings)
 
 def create_faiss_index(embeddings):
-    index = faiss.IndexFlatL2(embeddings.shape[1])
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
     index.add(embeddings)
     return index
 
@@ -65,7 +69,7 @@ def query_huggingface_flant5(question, context):
         "inputs": prompt,
         "parameters": {"max_new_tokens": 128}
     }
-    response = requests.post(FLAN_API_URL, headers=FLAN_HEADERS, json=payload)
+    response = requests.post(LLM_API_URL, headers=HEADERS, json=payload)
     if response.status_code == 200:
         return response.json()[0]["generated_text"].strip()
     else:
@@ -73,7 +77,7 @@ def query_huggingface_flant5(question, context):
 
 # --- App Streamlit ---
 
-st.set_page_config(page_title="Assistente PDF com FLAN-T5 + Embeddings API", layout="centered")
+st.set_page_config(page_title="Assistente PDF com FLAN-T5", layout="centered")
 st.title("📚 Assistente PDF com LLM")
 st.markdown("Faça upload de PDFs e faça perguntas com base no conteúdo.")
 
@@ -106,17 +110,16 @@ with st.sidebar:
 
 # Input do usuário
 query = st.chat_input("Digite sua pergunta")
-if query and st.session_state.faiss_index:
+if query and st.session_state.faiss_index is not None:
     with st.chat_message("user"):
         st.markdown(query)
     st.session_state.messages.append({"role": "user", "content": query})
 
-    # Gera embedding do input
-    payload = {"inputs": query}
-    response = requests.post(EMBEDDING_API_URL, headers=EMBEDDING_HEADERS, json=payload)
-    if response.status_code == 200:
-        question_embedding = np.array(response.json()).astype("float32").reshape(1, -1)
-        D, I = st.session_state.faiss_index.search(question_embedding, k=3)
+    question_embedding = generate_embedding_via_api(query)
+    if question_embedding is None:
+        st.error("Erro ao gerar embedding da pergunta.")
+    else:
+        D, I = st.session_state.faiss_index.search(question_embedding.reshape(1, -1), k=3)
         context = "\n".join([st.session_state.chunks[i] for i in I[0]])
 
         with st.spinner("Pensando..."):
@@ -125,8 +128,6 @@ if query and st.session_state.faiss_index:
         with st.chat_message("assistant"):
             st.markdown(answer)
         st.session_state.messages.append({"role": "assistant", "content": answer})
-    else:
-        st.error(f"Erro ao gerar embedding da pergunta: {response.text}")
 
 elif query:
     st.warning("Por favor, carregue e processe os PDFs primeiro.")
