@@ -38,10 +38,10 @@ def get_text_chunks(text, max_chunk_size=300):
     return chunks
 
 def generate_embedding_via_api(text):
-    payload = {"sentences": [text]}
+    payload = {"inputs": [text]}  # Note o campo inputs
     response = requests.post(EMBEDDING_API_URL, headers=HEADERS, json=payload)
     if response.status_code == 200:
-        return np.array(response.json()[0]).astype("float32")  # a API retorna uma lista dentro de lista
+        return np.array(response.json()[0]).astype("float32")
     else:
         st.error(f"Erro ao gerar embedding: {response.text}")
         return None
