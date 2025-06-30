@@ -1,7 +1,9 @@
 streamlit
 PyPDF2
-langchain
 langchain-community
+langchain-core
 sentence-transformers
-faiss-cpu
 numpy
+faiss-cpu
+transformers
+torch
