@@ -32,4 +32,4 @@ Este projeto implementa um assistente conversacional baseado em LLM (Large Langu
 
 
 ### obs: 
-Para enviar pelo drive, o venv de execução local teve que ser excluido.
+Para enviar pelo drive, o venv de execução local teve que ser excluido. Não foi possivel rodar localmente com o torch local no meu caso, uma vez que o pacote `torch` é muito pesado e grande, mas a aplicação que está rodando no link no inicio deste arquivo está em concordância com o código e os requirements dessa pasta.
