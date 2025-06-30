@@ -1,136 +1,123 @@
 import streamlit as st
 from PyPDF2 import PdfReader
+from sentence_transformers import SentenceTransformer
 import numpy as np
 import faiss
-import requests
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import torch
 
-# --- Configurações da Hugging Face ---
-HF_API_TOKEN = st.secrets["hf_token"]
-EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"  # modelo para embeddings
-LLM_MODEL_ID = "google/flan-t5-base"  # modelo para geração de texto
+# Configurações iniciais
+EMBEDDING_MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+LLM_MODEL_NAME = "google/flan-t5-large"
 
-EMBEDDING_API_URL = f"https://api-inference.huggingface.co/models/{EMBEDDING_MODEL_ID}"
-LLM_API_URL = f"https://api-inference.huggingface.co/models/{LLM_MODEL_ID}"
-
-HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-
-# --- Funções auxiliares ---
+@st.cache_resource
+def load_tokenizer_and_model():
+    tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
+    model = AutoModelForSeq2SeqLM.from_pretrained(LLM_MODEL_NAME)
+    return tokenizer, model
 
 def extract_text_from_pdf(pdf_files):
     text = ""
     for pdf in pdf_files:
-        reader = PdfReader(pdf)
-        for page in reader.pages:
-            text += page.extract_text() or ""
+        try:
+            reader = PdfReader(pdf)
+            for page in reader.pages:
+                page_text = page.extract_text() or ""
+                text += page_text + "\n"
+        except Exception as e:
+            st.error(f"Erro ao extrair texto do PDF {pdf.name}: {e}")
     return text
 
 def get_text_chunks(text, max_chunk_size=300):
-    sentences = text.split(". ")
-    chunks, current_chunk = [], ""
-    for sentence in sentences:
+    chunks = []
+    current_chunk = ""
+    for sentence in text.split('. '):
         if len(current_chunk) + len(sentence) < max_chunk_size:
             current_chunk += sentence + ". "
         else:
-            chunks.append(current_chunk.strip())
+            if current_chunk:
+                chunks.append(current_chunk.strip())
             current_chunk = sentence + ". "
     if current_chunk:
         chunks.append(current_chunk.strip())
-    return chunks
+    return [chunk for chunk in chunks if chunk]
 
-def generate_embedding_via_api(text):
-    payload = {"inputs": [text]}  # Note o campo inputs
-    response = requests.post(EMBEDDING_API_URL, headers=HEADERS, json=payload)
-    if response.status_code == 200:
-        return np.array(response.json()[0]).astype("float32")
-    else:
-        st.error(f"Erro ao gerar embedding: {response.text}")
-        return None
-    
-def generate_embeddings(chunks):
-    embeddings = []
-    for chunk in chunks:
-        emb = generate_embedding_via_api(chunk)
-        if emb is not None:
-            embeddings.append(emb)
-        else:
-            embeddings.append(np.zeros(384, dtype="float32"))  # fallback (dimensão do MiniLM é 384)
-    return np.vstack(embeddings)
+def generate_embeddings(text_chunks):
+    if not text_chunks:
+        return np.array([])
+    embeddings = EMBEDDING_MODEL.encode(text_chunks, show_progress_bar=False)
+    return embeddings.astype('float32')
 
 def create_faiss_index(embeddings):
+    if embeddings.size == 0:
+        return None
     dim = embeddings.shape[1]
     index = faiss.IndexFlatL2(dim)
     index.add(embeddings)
     return index
 
-def query_huggingface_flant5(question, context):
-    prompt = f"Context: {context}\n\nQuestion: {question}\nAnswer:"
-    payload = {
-        "inputs": prompt,
-        "parameters": {"max_new_tokens": 128}
-    }
-    response = requests.post(LLM_API_URL, headers=HEADERS, json=payload)
-    if response.status_code == 200:
-        return response.json()[0]["generated_text"].strip()
-    else:
-        return f"Erro: {response.text}"
+def generate_response_flant5(query, context_chunks, tokenizer, model, max_input_length=512):
+    # Junta os contextos numa string
+    context_str = "\n".join(context_chunks)
+    prompt = f"Responda a pergunta com base no texto abaixo:\n\n{context_str}\n\nPergunta: {query}\nResposta:"
+    
+    # Tokenizar entrada e truncar para max tokens permitidos
+    inputs = tokenizer(prompt, return_tensors="pt", max_length=max_input_length, truncation=True)
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=150)
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    # Remover o próprio prompt da resposta, se aparecer
+    response = response.replace(prompt, "").strip()
+    return response
 
-# --- App Streamlit ---
+# Interface Streamlit
+st.set_page_config(page_title="Assistente PDF com FLAN-T5-Large", layout="centered")
+st.title("📄 Assistente PDF com FLAN-T5-Large")
 
-st.set_page_config(page_title="Assistente PDF com FLAN-T5", layout="centered")
-st.title("📚 Assistente PDF com LLM")
-st.markdown("Faça upload de PDFs e faça perguntas com base no conteúdo.")
-
-# Sessão
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+if "text_chunks" not in st.session_state:
+    st.session_state.text_chunks = []
+if "embeddings" not in st.session_state:
+    st.session_state.embeddings = None
 if "faiss_index" not in st.session_state:
     st.session_state.faiss_index = None
-if "chunks" not in st.session_state:
-    st.session_state.chunks = []
+if "processed" not in st.session_state:
+    st.session_state.processed = False
 
-# Histórico de mensagens
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+pdf_files = st.file_uploader("Envie seus arquivos PDF", accept_multiple_files=True, type=["pdf"])
 
-# Upload e processamento
-with st.sidebar:
-    st.header("📂 Upload de PDF")
-    pdf_files = st.file_uploader("Escolha seus arquivos", accept_multiple_files=True, type="pdf")
-    if st.button("🔍 Processar PDFs"):
-        raw_text = extract_text_from_pdf(pdf_files)
-        chunks = get_text_chunks(raw_text)
-        embeddings = generate_embeddings(chunks)
-        index = create_faiss_index(embeddings)
-
-        st.session_state.chunks = chunks
-        st.session_state.faiss_index = index
-        st.success("PDFs processados com sucesso!")
-
-# Input do usuário
-query = st.chat_input("Digite sua pergunta")
-if query and st.session_state.faiss_index is not None:
-    with st.chat_message("user"):
-        st.markdown(query)
-    st.session_state.messages.append({"role": "user", "content": query})
-
-    question_embedding = generate_embedding_via_api(query)
-    if question_embedding is None:
-        st.error("Erro ao gerar embedding da pergunta.")
+if st.button("Processar PDFs"):
+    if pdf_files:
+        with st.spinner("Extraindo texto e criando índice..."):
+            raw_text = extract_text_from_pdf(pdf_files)
+            chunks = get_text_chunks(raw_text)
+            embeddings = generate_embeddings(chunks)
+            faiss_index = create_faiss_index(embeddings)
+            
+            st.session_state.text_chunks = chunks
+            st.session_state.embeddings = embeddings
+            st.session_state.faiss_index = faiss_index
+            st.session_state.processed = True
+            
+        st.success(f"Processados {len(pdf_files)} arquivos com {len(chunks)} chunks.")
     else:
-        D, I = st.session_state.faiss_index.search(question_embedding.reshape(1, -1), k=3)
-        context = "\n".join([st.session_state.chunks[i] for i in I[0]])
+        st.warning("Por favor, envie ao menos um arquivo PDF.")
 
-        with st.spinner("Pensando..."):
-            answer = query_huggingface_flant5(query, context)
+tokenizer, model = load_tokenizer_and_model()
 
-        with st.chat_message("assistant"):
-            st.markdown(answer)
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+query = st.text_input("Faça sua pergunta sobre os PDFs processados")
 
+if st.session_state.processed and query:
+    # Gerar embedding da pergunta
+    query_embedding = EMBEDDING_MODEL.encode([query]).astype('float32')
+    D, I = st.session_state.faiss_index.search(query_embedding, k=3)
+    # Recuperar chunks relevantes
+    relevant_chunks = [st.session_state.text_chunks[i] for i in I[0] if i < len(st.session_state.text_chunks)]
+    
+    with st.spinner("Gerando resposta..."):
+        answer = generate_response_flant5(query, relevant_chunks, tokenizer, model)
+    st.markdown(f"**Resposta:** {answer}")
 elif query:
-    st.warning("Por favor, carregue e processe os PDFs primeiro.")
+    st.warning("Por favor, faça o upload e processe os PDFs antes de perguntar.")
 
-# Rodapé
 st.markdown("---")
 st.caption("Made by André Arantes")
