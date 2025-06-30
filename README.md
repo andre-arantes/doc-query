@@ -29,3 +29,7 @@ Este projeto implementa um assistente conversacional baseado em LLM (Large Langu
     ```bash
     streamlit run seu_script.py
 3. Carregue seus PDFs na barra lateral, processe e comece a fazer perguntas no chat.
+
+
+### obs: 
+Para enviar pelo drive, o venv de execução local teve que ser excluido.
